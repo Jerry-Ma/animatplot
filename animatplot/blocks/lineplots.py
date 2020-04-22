@@ -183,52 +183,100 @@ class Scatter(Block):
     This block accepts additional keyword arguments to be passed to
     :meth:`matplotlib.axes.Axes.scatter`
     """
-    def __init__(self, x, y, s=None, c=None, ax=None, t_axis=0, **kwargs):
+    def __init__(
+            self, x, y, s=None, c=None,
+            s_in_data_unit=False,
+            ax=None, t_axis=0,
+            post_update=None,
+            **kwargs):
         self.x = np.asanyarray(x)
         self.y = np.asanyarray(y)
+        self.s = np.asanyarray(s)
+        self.c = np.asanyarray(c)
+        self.s_in_data_unit = s_in_data_unit
+        self.post_update = post_update
         if self.x.shape != self.y.shape:
             raise ValueError("x, y must have the same shape"
                              "or be lists of the same length")
+        # figure out which object is to be animated
+        # by look at the number of dimensions
+        shape, avar = sorted(
+                [
+                    (getattr(self, var).ndim, var)
+                    for var in ['x', 'y', 's', 'c']
+                    ],
+                key=lambda x: x[0]
+                )[-1]
+        # av is the variable that have time axes
+        self.av = getattr(self, avar)
+        self._like_av = dict()
 
-        self.c = c
-        self.s = self._parse_s(s)
+        for var in ['x', 'y', 's', 'c']:
+            setattr(self, var, self._parse_var(var, t_axis))
         super().__init__(ax, t_axis)
 
         self._is_list = (self.x.dtype == 'object')
-        Slice = self._make_slice(0, 2)
-        s_Slice = self._make_s_slice(0, 2)
-        self.scat = self.ax.scatter(self.x[Slice], self.y[Slice],
-                                    self.s[s_Slice], self.c, **kwargs)
+        x_slice = self._make_var_slice('x', 0, 2)
+        y_slice = self._make_var_slice('y', 0, 2)
+        s_slice = self._make_var_slice('s', 0, 2)
+        c_slice = self._make_var_slice('c', 0, 2)
+        self.scat = self.ax.scatter(self.x[x_slice], self.y[y_slice],
+                                    self._calc_actual_size(self.s[s_slice]),
+                                    self.c[c_slice],
+                                    **kwargs)
 
-    def _parse_s(self, s):
-        s = np.asanyarray(s)
-        self._s_like_x = (s.shape == self.x.shape)
-        if not self._s_like_x:
-            if len(s.shape) == 0:
-                s = s[None]
+    def _parse_var(self, var, t_axis):
+        v = getattr(self, var)
+        self._like_av[var] = v_like_av = (v.shape == self.av.shape)
+        if not v_like_av:
+            if len(v.shape) == 0:
+                v = v[None]
+            elif len(v.shape) == 1:
+                v = np.swapaxes(v[None, :], 0, t_axis)
             else:
                 raise ValueError("s is not a scalar, or like x/y.")
-        return s
+        return v
 
-    def _make_s_slice(self, i, dim):
-        if self._s_like_x:
+    def _make_var_slice(self, var, i, dim):
+        if self._like_av[var]:
             return self._make_slice(i, dim)
         return 0
 
     def _update(self, i):
-        Slice = self._make_slice(i, 2)
-        s_slice = self._make_s_slice(i, 2)
-
-        x, y = self.x[Slice], self.y[Slice]
-        data = np.vstack((x, y)).T
-
-        self.scat.set_offsets(data)  # x, y
-        if self._s_like_x:
-            self.scat._sizes = self.s[s_slice]
-        # self.scat.set_array(x_vector, y_vector) # color
+        if self._like_av['x'] and self._like_av['y']:
+            x_slice = self._make_var_slice('x', i, 2)
+            y_slice = self._make_var_slice('y', i, 2)
+            x, y = self.x[x_slice], self.y[y_slice]
+            data = np.vstack((x, y)).T
+            self.scat.set_offsets(data)  # x, y
+        if self._like_av['s'] or self.s_in_data_unit:
+            s_slice = self._make_var_slice('s', i, 2)
+            s = self._calc_actual_size(self.s[s_slice])
+            # compute actual size
+            self.scat.set_sizes(s)
+        if self._like_av['c']:
+            c_slice = self._make_var_slice('c', i, 2)
+            self.scat.set_array(self.c[c_slice])  # color
+        if self.post_update is not None:
+            self.post_update(self, i)
         return self.scat
+
+    def _calc_actual_size(self, s):
+        if self._like_av['s'] or (not self.s_in_data_unit):
+            return self.s
+        if np.isscalar(s):
+            s = np.array([s])
+        ax = self.ax
+        s_pix = (
+                ax.transData.transform(
+                    np.tile(s, (2, 1)).T) -
+                ax.transData.transform(
+                    np.zeros((len(s), 2))))[:, 0]
+        # Calculate and update size in points:
+        size_pt = (s_pix / ax.figure.dpi * 72) ** 2
+        return size_pt
 
     def __len__(self):
         if self._is_list:
-            return self.x.shape[0]
-        return self.x.shape[self.t_axis]
+            return self.av.shape[0]
+        return self.av.shape[self.t_axis]
